@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+watchlog-lite — tiny Flask UI to browse /var/log/watchguard
+
+Features
+- Lists hosts and months under /var/log/watchguard/<host>/<YYYYMM>/watchguard.log
+- Quick search by substring or regex (port, IP, etc.)
+- Tails last N lines with optional live auto-refresh
+- Super lightweight: single file, no DB
+- Optional HTTP Basic Auth via env vars WATCHLOG_USER / WATCHLOG_PASS
+
+Run (dev):
+  python3 app.py
+
+Run (prod):
+  pip install gunicorn
+  gunicorn -w 2 -b 0.0.0.0:8811 app:app
+
+Security: This is meant for your internal LAN only. Put it behind your firewall/VPN.
+"""
+import os
+import re
+import time
+import html
+from pathlib import Path
+from typing import Iterable, List
+from flask import Flask, request, abort, Response, render_template_string, redirect, url_for
+
+BASE = Path('/var/log/watchguard').resolve()
+app = Flask(__name__)
+
+# -------------------- Basic Auth (optional) --------------------
+USER = os.getenv('WATCHLOG_USER')
+PASS = os.getenv('WATCHLOG_PASS')
+
+def check_auth(u, p):
+    return USER and PASS and (u == USER and p == PASS)
+
+def require_auth():
+    from functools import wraps
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            if USER and PASS:
+                auth = request.authorization
+                if not auth or not check_auth(auth.username, auth.password):
+                    return Response('Auth required', 401, {'WWW-Authenticate': 'Basic realm="watchlog"'})
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+# -------------------- Helpers --------------------
+
+def safe_join(base: Path, *paths: str) -> Path:
+    p = base
+    for part in paths:
+        p = p / part
+    p = p.resolve()
+    if not str(p).startswith(str(base)):
+        abort(400, 'Invalid path')
+    return p
+
+MONTH_RE = re.compile(r"^\d{6}$")  # YYYYMM
+
+
+def list_hosts() -> List[str]:
+    if not BASE.exists():
+        return []
+    return sorted([p.name for p in BASE.iterdir() if p.is_dir()])
+
+
+def list_months(host: str) -> List[str]:
+    host_dir = safe_join(BASE, host)
+    if not host_dir.exists():
+        return []
+    return sorted([p.name for p in host_dir.iterdir() if p.is_dir() and MONTH_RE.match(p.name)], reverse=True)
+
+
+def log_path(host: str, month: str) -> Path:
+    if not MONTH_RE.match(month):
+        abort(400, 'Bad month format')
+    return safe_join(BASE, host, month, 'watchguard.log')
+
+
+def tail_lines(path: Path, n: int = 200) -> List[str]:
+    """Efficient-ish tail without external deps."""
+    try:
+        with path.open('rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = 4096
+            data = b''
+            while size > 0 and data.count(b'\n') <= n:
+                jump = min(block, size)
+                size -= jump
+                f.seek(size)
+                data = f.read(jump) + data
+            lines = data.splitlines()[-n:]
+        return [line.decode('utf-8', 'replace') for line in lines]
+    except FileNotFoundError:
+        return []
+
+
+def grep_lines(lines: Iterable[str], needle: str = '', regex: bool = False) -> List[str]:
+    if not needle:
+        return list(lines)
+    if regex:
+        try:
+            pat = re.compile(needle, re.IGNORECASE)
+        except re.error as e:
+            return [f"[regex error] {e}"]
+        return [ln for ln in lines if pat.search(ln)]
+    else:
+        low = needle.lower()
+        return [ln for ln in lines if low in ln.lower()]
+
+# -------------------- UI --------------------
+
+LAYOUT = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>watchlog-lite</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    body{max-width:1100px;margin:auto}
+    code{white-space:pre-wrap}
+    .log{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; white-space: pre;}
+    .muted{opacity:.7}
+  </style>
+</head>
+<body>
+  <nav><ul>
+    <li><strong>watchlog-lite</strong></li>
+    <li class="muted">{{ base }}</li>
+    {% if host %}<li>Host: <strong>{{ host }}</strong></li>{% endif %}
+    {% if month %}<li>Month: <strong>{{ month }}</strong></li>{% endif %}
+  </ul></nav>
+  <main>
+    {% block body %}{% endblock %}
+  </main>
+</body>
+</html>
+"""
+
+@app.get('/')
+@require_auth()
+def index():
+    hosts = list_hosts()
+    return render_template_string(LAYOUT + """
+    {% block body %}
+      <h3>Hosts</h3>
+      {% if not hosts %}
+        <p>No logs yet. Point your Firebox syslog to this server, then refresh.</p>
+      {% else %}
+        <ul>
+        {% for h in hosts %}
+          <li><a href="{{ url_for('host_view', host=h) }}">{{ h }}</a></li>
+        {% endfor %}
+        </ul>
+      {% endif %}
+    {% endblock %}
+    """, hosts=hosts, base=str(BASE), host=None, month=None)
+
+@app.get('/h/<host>')
+@require_auth()
+def host_view(host):
+    months = list_months(host)
+    return render_template_string(LAYOUT + """
+    {% block body %}
+      <h3>Host: {{ host }}</h3>
+      {% if not months %}
+        <p>No month folders yet for this host.</p>
+      {% else %}
+        <ul>
+        {% for m in months %}
+          <li><a href="{{ url_for('view_log', host=host, month=m) }}">{{ m }}</a></li>
+        {% endfor %}
+        </ul>
+      {% endif %}
+      <p><a href="{{ url_for('index') }}">← All hosts</a></p>
+    {% endblock %}
+    """, host=host, months=months, base=str(BASE), month=None)
+
+@app.get('/view')
+@require_auth()
+def view_log():
+    host = request.args.get('host','')
+    month = request.args.get('month','')
+    q = request.args.get('q','')
+    rx = request.args.get('rx','0') == '1'
+    n = int(request.args.get('n','400'))
+    auto = request.args.get('auto','0') == '1'
+
+    path = log_path(host, month)
+    lines = tail_lines(path, n=n)
+    out = grep_lines(lines, q, regex=rx)
+
+    if auto:
+        # simple auto-refresh every 3s
+        refresh = '<meta http-equiv="refresh" content="3">'
+    else:
+        refresh = ''
+
+    body = [
+        f"<h3>Log: {html.escape(str(path))}</h3>",
+        "<form method='get'>",
+        f"<input type='hidden' name='host' value='{html.escape(host)}'>",
+        f"<input type='hidden' name='month' value='{html.escape(month)}'>",
+        "<label>Last lines <input type='number' name='n' min='50' max='5000' value='"+str(n)+"'></label>",
+        "<label>Filter (substring or regex) <input type='text' name='q' placeholder='e.g. 38315 or 192.168.1.' value='"+html.escape(q)+"'></label>",
+        "<label><input type='checkbox' name='rx' value='1' "+("checked" if rx else "")+"> Regex</label>",
+        "<label><input type='checkbox' name='auto' value='1' "+("checked" if auto else "")+"> Auto-refresh</label>",
+        "<button type='submit'>Apply</button>",
+        "</form>",
+        f"<p><a href='{url_for('host_view', host=host)}'>← Months for {html.escape(host)}</a></p>",
+        "<pre class='log'>" + html.escape("\n".join(out)) + "</pre>"
+    ]
+
+    return render_template_string(LAYOUT.replace('</head>', refresh + '</head>') + """
+    {% block body %}{{ body|safe }}{% endblock %}
+    """, body="\n".join(body), base=str(BASE), host=host, month=month)
+
+@app.get('/q')
+@require_auth()
+def quick_query():
+    """Global search across latest month per host. Lightweight approximation."""
+    needle = request.args.get('q','')
+    rx = request.args.get('rx','0') == '1'
+    n = int(request.args.get('n','400'))
+
+    rows = []
+    for host in list_hosts():
+        months = list_months(host)
+        if not months:
+            continue
+        path = log_path(host, months[0])
+        lines = tail_lines(path, n=n)
+        for ln in grep_lines(lines, needle, regex=rx):
+            rows.append((host, months[0], ln))
+
+    rows = rows[:2000]
+
+    html_rows = "\n".join(
+        f"<tr><td>{html.escape(h)}</td><td>{html.escape(m)}</td><td><code>{html.escape(ln)}</code></td></tr>"
+        for h,m,ln in rows
+    )
+    page = LAYOUT + """
+    {% block body %}
+      <h3>Quick Search</h3>
+      <form method="get">
+        <label>Filter <input name="q" value="{{q}}" placeholder="e.g. 38315 or 192.168."></label>
+        <label><input type="checkbox" name="rx" value="1" {% if rx %}checked{% endif %}> Regex</label>
+        <label>Tail per host <input type="number" name="n" min="100" max="5000" value="{{n}}"></label>
+        <button type="submit">Search</button>
+      </form>
+      <p class="muted">Showing up to {{rows|length}} matches (latest month per host)</p>
+      <table>
+        <thead><tr><th>Host</th><th>Month</th><th>Line</th></tr></thead>
+        <tbody>{{ html_rows|safe }}</tbody>
+      </table>
+      <p><a href="{{ url_for('index') }}">← Home</a></p>
+    {% endblock %}
+    """
+    return render_template_string(page, q=needle, rx=rx, n=n, rows=rows, html_rows=html_rows, base=str(BASE), host=None, month=None)
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', '8811'))
+    app.run(host='0.0.0.0', port=port, debug=False)

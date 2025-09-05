@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+.vscode/
+# deployment files you might add later
+watchlog-lite.service
