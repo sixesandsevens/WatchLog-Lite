@@ -7,3 +7,4 @@ __pycache__/
 .vscode/
 # deployment files you might add later
 watchlog-lite.service
+*.bak
