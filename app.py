@@ -481,11 +481,11 @@ def index():
     else:
         results_html = '<div class="box lines">' + rendered + '</div>'
     saved_html = '<div class="bar"><input type="text" id="saveName" placeholder="Save as..." style="width:160px"><button type="button" id="saveBtn">Save filter</button><span id="savedList"></span></div>'
-    r_js = refresh if refresh.isdigit() else "0"
     script = """
     <script>
     (function(){
-      var r=%s;
+      var params=new URLSearchParams(location.search);
+      var r=parseInt(params.get('refresh')||'0',10);
       var paused=false; var cb=document.getElementById('pauseRefresh'); if(cb) cb.addEventListener('change',function(){paused=this.checked});
       if(r>0){ setInterval(function(){ if(!paused) location.reload(); }, r*1000); }
       var q=document.getElementById('q'); var view=document.getElementById('view'); var wrap=document.getElementById('wrap');
@@ -538,7 +538,7 @@ def index():
         <li><b>?</b>: toggle help</li>
       </ul>
     </div></div>
-    """ % r_js
+    """
     content = form + saved_html + summary_html + counts_html + download_html + results_html + script
     return render_template_string(LAYOUT, content=content)
 
