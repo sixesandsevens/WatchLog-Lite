@@ -1,0 +1,10 @@
+[
+Unit]
+Description=WatchLog-Lite BitTorrent detector
+
+[Service]
+Type=oneshot
+Environment=WG_HOST=GRC-GAIN-FW01-2
+# Environment=SLACK_WEBHOOK=https://hooks.slack.com/services/...
+ExecStart=/usr/bin/python3 /opt/watchlog-lite/tools/detector.py
+

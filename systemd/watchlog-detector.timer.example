@@ -1,0 +1,12 @@
+[Unit]
+Description=Run WatchLog detector every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=watchlog-detector.service
+
+[Install]
+WantedBy=timers.target
+
