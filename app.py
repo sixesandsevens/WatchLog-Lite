@@ -1,9 +1,11 @@
-import os, re, html, io, collections
-import json
-from collections import deque
+import os, re, html, io, collections, json
 from pathlib import Path
 from flask import Flask, request, Response, render_template_string, send_file
 from datetime import datetime, timezone
+from watchlog_lite.services.logs import (
+    list_hosts, list_months, tail_file, apply_filters, summarize, pick_log_path, parse_kv, BASE as LOG_BASE
+)
+from watchlog_lite.services.ui import pretty_header, fold_dupes
 
 LOG_ROOT = Path("/var/log/watchguard")
 USER = os.getenv("WATCHLOG_USER", "admin")
@@ -97,231 +99,7 @@ def tail_file(path: Path, n: int):
     except FileNotFoundError:
         return None
 
-# ---------- Helpers ----------
-RE_IP    = re.compile(r'(?:src(?:_ip)?=|saddr=)(\d+\.\d+\.\d+\.\d+)')
-RE_DPORT = re.compile(r'(?:d(?:st_)?port=|dpt=)(\d{1,5})')
-KV       = re.compile(r'(\w+)=([^\s]+)')
-
-# Optional host mapping: /opt/watchlog-lite/hosts.yaml with lines like "1.2.3.4: laptop"
-HOSTS_FILE = Path("/opt/watchlog-lite/hosts.yaml")
-_HOST_MAP = None
-_HOST_MAP_MTIME = None
-
-def _load_hosts_map():
-    global _HOST_MAP, _HOST_MAP_MTIME
-    try:
-        st = HOSTS_FILE.stat()
-    except FileNotFoundError:
-        _HOST_MAP = {}
-        _HOST_MAP_MTIME = None
-        return _HOST_MAP
-    if _HOST_MAP is not None and _HOST_MAP_MTIME == st.st_mtime:
-        return _HOST_MAP
-    mp = {}
-    try:
-        with HOSTS_FILE.open('r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'): continue
-                # very tiny YAML-ish: ip: name
-                if ':' in line:
-                    ip, name = line.split(':', 1)
-                    mp[ip.strip()] = name.strip()
-    except Exception:
-        mp = {}
-    _HOST_MAP = mp
-    _HOST_MAP_MTIME = st.st_mtime
-    return _HOST_MAP
-
-def _map_ip(ip: str) -> str:
-    if not ip: return ip
-    mp = _load_hosts_map()
-    if ip in mp:
-        return f"{mp[ip]} ({ip})"
-    return ip
-
-def parse_kv(line: str):
-    d = dict(KV.findall(line))
-    d["src_ip"] = d.get("src") or d.get("src_ip") or d.get("saddr")
-    d["dst_ip"] = d.get("dst") or d.get("dst_ip") or d.get("daddr")
-    d["dport"]  = d.get("dport") or d.get("dst_port") or d.get("dpt")
-    d["sport"]  = d.get("sport") or d.get("src_port") or d.get("spt")
-    d["action"] = d.get("action") or d.get("msg") or d.get("log")
-    d["ip"] = d.get("src_ip")  # alias for convenience in filters
-    # Attempt to normalize timestamp fields if present
-    # WatchGuard often has date=YYYY-MM-DD time=HH:MM:SS or ts=iso8601
-    ts = d.get("ts") or None
-    if not ts:
-        date, time_ = d.get("date"), d.get("time")
-        if date and time_:
-            ts = f"{date} {time_}"
-    d["ts"] = ts
-    return d
-
-def _rel_time(ts: str) -> str:
-    if not ts:
-        return ""
-    s = ts.strip()
-    dt = None
-    try:
-        if 'T' in s or 'Z' in s:
-            s2 = s.replace('Z', '+00:00')
-            dt = datetime.fromisoformat(s2)
-        else:
-            # assume "YYYY-MM-DD HH:MM:SS"
-            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        dt = None
-    if not dt:
-        return ts
-    now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
-    delta = now - dt
-    secs = int(delta.total_seconds())
-    if secs < 0:
-        secs = 0
-    if secs < 60:
-        return f"{secs}s ago"
-    mins = secs // 60
-    if mins < 60:
-        return f"{mins}m ago"
-    hours = mins // 60
-    if hours < 24:
-        return f"{hours}h ago"
-    days = hours // 24
-    return f"{days}d ago"
-
-def summarize(lines):
-    ips, ports = collections.Counter(), collections.Counter()
-    for ln in lines:
-        m = RE_IP.search(ln)
-        if m and m.group(1).startswith("192.168."):
-            ips[m.group(1)] += 1
-        m = RE_DPORT.search(ln)
-        if m:
-            ports[m.group(1)] += 1
-    return ips.most_common(10), ports.most_common(10)
-
-def apply_filters(lines, regex, q_raw: str):
-    """Advanced filters: supports
-    - regex tokens (space or | separated)
-    - negative tokens: -word
-    - key=value and key!=value
-    - numeric ranges: dport=6881-6999 (and sport)
-    Regex and structured terms combine with OR semantics for positive matches.
-    Negatives always exclude.
-    """
-    terms = [t for t in re.split(r'[| ]+', (q_raw or '').strip()) if t]
-    rx_pos_terms = [t for t in terms if ('=' not in t) and not t.startswith('-')]
-    rx_neg_terms = [t[1:] for t in terms if t.startswith('-') and ('=' not in t)]
-    kv_pos, kv_neg, range_pos = [], [], []
-    for t in terms:
-        if '=' in t:
-            if '!=' in t:
-                k, v = t.split('!=', 1)
-                kv_neg.append((k, v))
-            else:
-                k, v = t.split('=', 1)
-                if re.fullmatch(r'\d+-\d+', v) and k in {"dport", "sport"}:
-                    lo, hi = v.split('-', 1)
-                    try:
-                        range_pos.append((k, int(lo), int(hi)))
-                    except ValueError:
-                        pass
-                else:
-                    kv_pos.append((k, v))
-
-    rx_pos = None
-    rx_neg = None
-    if rx_pos_terms:
-        try:
-            rx_pos = re.compile("|".join(rx_pos_terms), re.I)
-        except re.error:
-            rx_pos = None
-    if rx_neg_terms:
-        try:
-            rx_neg = re.compile("|".join(rx_neg_terms), re.I)
-        except re.error:
-            rx_neg = None
-
-    def keep(line: str) -> bool:
-        # Negative regex excludes
-        if rx_neg and rx_neg.search(line):
-            return False
-
-        need_struct = bool(kv_pos or range_pos or kv_neg)
-        kv = None
-        if need_struct:
-            kv = parse_kv(line)
-            # Negative KV excludes
-            for k, v in kv_neg:
-                if kv.get(k) == v:
-                    return False
-
-        # Range requirements
-        ranges_ok = True
-        if range_pos:
-            for k, lo, hi in range_pos:
-                try:
-                    val = int(kv.get(k) or -1)
-                except (TypeError, ValueError):
-                    return False
-                if not (lo <= val <= hi):
-                    return False
-
-        # Positive KV requirements
-        kv_ok = all(kv.get(k) == v for k, v in kv_pos) if kv_pos else False
-
-        # Regex positive match (either via combined regex or separate rx_pos)
-        rx_ok = bool(regex.search(line)) if regex else False
-        if rx_pos is not None:
-            rx_ok = rx_ok or bool(rx_pos.search(line))
-
-        if regex or rx_pos is not None:
-            if kv_pos or range_pos:
-                return rx_ok or ((not kv_pos or kv_ok) and (not range_pos or ranges_ok))
-            return rx_ok
-        if kv_pos or range_pos:
-            return ((not kv_pos or kv_ok) and (not range_pos or ranges_ok))
-        return True
-
-    return [ln for ln in lines if keep(ln)]
-
-def pick_log_path(host: str, ym: str) -> Path:
-    return LOG_ROOT / host / ym / "watchguard.log"
-
-def pretty_header(kv: dict) -> str:
-    act = (kv.get("action") or "").lower()
-    badge = f'<span class="badge {act}">{html.escape(kv.get("action") or "")}</span>' if act else ""
-    def _is_private(ip: str) -> bool:
-        return ip.startswith("10.") or ip.startswith("192.168.") or (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31) or ip.startswith("127.")
-    src_ip = kv.get("src_ip") or ""
-    dst_ip = kv.get("dst_ip") or ""
-    src = _map_ip(src_ip) + ((":" + kv.get("sport")) if kv.get("sport") else "")
-    dst = _map_ip(dst_ip) + ((":" + kv.get("dport")) if kv.get("dport") else "")
-    flow = f'<span class="flow">{html.escape(src)} → {html.escape(dst)}</span>' if (src or dst) else ""
-    whois = ""
-    if dst_ip and not _is_private(dst_ip):
-        whois = f' <a class="chip" target="_blank" rel="noreferrer" href="https://rdap.org/ip/{html.escape(dst_ip)}">whois</a>'
-    rel = ""
-    if kv.get("ts"):
-        reltxt = _rel_time(kv.get("ts"))
-        if reltxt:
-            rel = f' <span class="chip muted">{html.escape(reltxt)}</span>'
-    return badge + flow + whois + rel
-
-def fold_dupes(lines):
-    out = []
-    last = None
-    cnt = 0
-    for ln in lines + [None]:
-        if ln == last:
-            cnt += 1
-            continue
-        if last is not None:
-            suf = f' <span class="badge" style="background:#334155;color:#cbd5e1">×{cnt}</span>' if cnt > 1 else ''
-            out.append((last, suf))
-        last, cnt = ln, 1
-    return out
+"""Helper functions have been moved into watchlog_lite.services.* modules."""
 
 @app.get("/")
 @requires_auth
@@ -334,7 +112,7 @@ def index():
     host = request.args.get("host", hosts[-1])
     months = list_months(host)
     if not months:
-        body = f"<p>No month folders under <code>{html.escape(str(LOG_ROOT/host))}</code></p>"
+        body = f"<p>No month folders under <code>{html.escape(str(LOG_BASE/host))}</code></p>"
         return render_template_string(LAYOUT, content=body)
 
     ym = request.args.get("ym", months[-1])
@@ -483,50 +261,63 @@ def index():
         results_html = '<div class="box lines">' + rendered + '</div>'
     saved_html = '<div class="bar"><input type="text" id="saveName" placeholder="Save as..." style="width:160px"><button type="button" id="saveBtn">Save filter</button><span id="savedList"></span></div>'
     r_js = refresh if refresh.isdigit() else "0"
+
+
     script = """
     <script>
-    (function(){
-      var r=%s;
-      var paused=false; var cb=document.getElementById('pauseRefresh'); if(cb) cb.addEventListener('change',function(){paused=this.checked});
-      if(r>0){ setInterval(function(){ if(!paused) location.reload(); }, r*1000); }
-      var q=document.getElementById('q'); var view=document.getElementById('view'); var wrap=document.getElementById('wrap');
-      var saveBtn=document.getElementById('saveBtn'); var saveName=document.getElementById('saveName'); var list=document.getElementById('savedList');
-      function renderSaved(){
-        var m = JSON.parse(localStorage.getItem('watchlog_saves')||'{}');
-        list.innerHTML='';
-        Object.keys(m).sort().forEach(function(k){
-          var a=document.createElement('a'); a.href='javascript:void(0)'; a.className='chip'; a.textContent=k; a.onclick=function(){
-            var s=m[k];
-            q.value=s.q||''; view.value=s.view||'pretty'; wrap.checked=s.wrap==='1';
-            var params=new URLSearchParams(location.search);
-            params.set('q', q.value); params.set('view', view.value); params.set('wrap', wrap.checked?'1':'0');
-            location.search = params.toString();
+    (function () {
+      // Auto-refresh + Pause
+      var params = new URLSearchParams(location.search);
+      var r = parseInt(params.get('refresh') || '0', 10);
+      var paused = false;
+      var cb = document.getElementById('pauseRefresh');
+      if (cb) cb.addEventListener('change', function () { paused = this.checked; });
+      if (r > 0) { setInterval(function () { if (!paused) location.reload(); }, r * 1000); }
+
+      // Saved filters
+      var qEl = document.getElementById('q');
+      var viewEl = document.getElementById('view');
+      var wrapEl = document.getElementById('wrap');
+      var saveBtn = document.getElementById('saveBtn');
+      var saveName = document.getElementById('saveName');
+      var list = document.getElementById('savedList');
+      function renderSaved() {
+        var m = JSON.parse(localStorage.getItem('watchlog_saves') || '{}');
+        list.innerHTML = '';
+        Object.keys(m).sort().forEach(function (k) {
+          var a = document.createElement('a'); a.href = 'javascript:void(0)'; a.className = 'chip'; a.textContent = k; a.onclick = function () {
+            var s = m[k];
+            qEl.value = s.q || ''; viewEl.value = s.view || 'pretty'; wrapEl.checked = s.wrap === '1';
+            var p = new URLSearchParams(location.search);
+            p.set('q', qEl.value); p.set('view', viewEl.value); p.set('wrap', wrapEl.checked ? '1' : '0');
+            location.search = p.toString();
           }; list.appendChild(a);
         });
       }
       renderSaved();
-      if(saveBtn) saveBtn.onclick=function(){
-        var name=saveName.value.trim(); if(!name) return;
-        var m = JSON.parse(localStorage.getItem('watchlog_saves')||'{}');
-        m[name] = {q: q.value, view: view.value, wrap: wrap.checked?'1':'0'};
+      if (saveBtn) saveBtn.onclick = function () {
+        var name = saveName.value.trim(); if (!name) return;
+        var m = JSON.parse(localStorage.getItem('watchlog_saves') || '{}');
+        m[name] = { q: qEl.value, view: viewEl.value, wrap: wrapEl.checked ? '1' : '0' };
         localStorage.setItem('watchlog_saves', JSON.stringify(m));
-        saveName.value=''; renderSaved();
+        saveName.value = ''; renderSaved();
       };
-      // Shortcuts
-      var helpShown=false; function toggleHelp(){ var o=document.getElementById('helpOverlay'); if(!o) return; helpShown=!helpShown; o.style.display=helpShown?'flex':'none'; }
-      // Filter popover toggle
-      (function(){
-        var btn=document.getElementById('qHelp'); var pop=document.getElementById('qHelpPop');
-        if(!btn||!pop) return;
-        btn.addEventListener('click', function(ev){ ev.preventDefault(); pop.classList.toggle('open'); });
-        document.addEventListener('click', function(ev){ if(pop.classList.contains('open')){ var t=ev.target; if(t!==pop && !pop.contains(t) && t!==btn){ pop.classList.remove('open'); } } });
+
+      // Popover toggle
+      (function () {
+        var btn = document.getElementById('qHelp'); var pop = document.getElementById('qHelpPop');
+        if (!btn || !pop) return;
+        btn.addEventListener('click', function (ev) { ev.preventDefault(); pop.classList.toggle('open'); });
+        document.addEventListener('click', function (ev) { if (pop.classList.contains('open')) { var t = ev.target; if (t !== pop && !pop.contains(t) && t !== btn) { pop.classList.remove('open'); } } });
       })();
 
-      document.addEventListener('keydown', function(e){
-        if(e.key==='/' && !e.metaKey && !e.ctrlKey && !e.altKey){ e.preventDefault(); var el=document.getElementById('q'); if(el) el.focus(); }
-        else if(e.key==='r' && !e.metaKey && !e.ctrlKey && !e.altKey){ var w=document.getElementById('wrap'); if(w){w.checked=!w.checked; var params=new URLSearchParams(location.search); params.set('wrap', w.checked?'1':'0'); location.search=params.toString();} }
-        else if(e.key==='p' && !e.metaKey && !e.ctrlKey && !e.altKey){ var v=document.getElementById('view'); if(v){ var opts=['raw','pretty','chips']; var i=opts.indexOf(v.value); v.value=opts[(i+1)%opts.length]; var params=new URLSearchParams(location.search); params.set('view', v.value); location.search=params.toString(); } }
-        else if(e.key==='?' && !e.metaKey && !e.ctrlKey && !e.altKey){ e.preventDefault(); toggleHelp(); }
+      // Shortcuts
+      var helpShown = false; function toggleHelp() { var o = document.getElementById('helpOverlay'); if (!o) return; helpShown = !helpShown; o.style.display = helpShown ? 'flex' : 'none'; }
+      document.addEventListener('keydown', function (e) {
+        if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey) { e.preventDefault(); var el = document.getElementById('q'); if (el) el.focus(); }
+        else if (e.key === 'r' && !e.metaKey && !e.ctrlKey && !e.altKey) { var w = document.getElementById('wrap'); if (w) { w.checked = !w.checked; var p = new URLSearchParams(location.search); p.set('wrap', w.checked ? '1' : '0'); location.search = p.toString(); } }
+        else if (e.key === 'p' && !e.metaKey && !e.ctrlKey && !e.altKey) { var v = document.getElementById('view'); if (v) { var opts = ['raw','pretty','chips']; var i = opts.indexOf(v.value); v.value = opts[(i + 1) % opts.length]; var p = new URLSearchParams(location.search); p.set('view', v.value); location.search = p.toString(); } }
+        else if (e.key === '?' && !e.metaKey && !e.ctrlKey && !e.altKey) { e.preventDefault(); toggleHelp(); }
       });
     })();
     </script>
@@ -539,7 +330,9 @@ def index():
         <li><b>?</b>: toggle help</li>
       </ul>
     </div></div>
-    """ % r_js
+    """
+
+
     content = form + saved_html + summary_html + counts_html + download_html + results_html + script
     return render_template_string(LAYOUT, content=content)
 
