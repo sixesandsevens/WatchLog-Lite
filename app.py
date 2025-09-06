@@ -6,8 +6,9 @@ from watchlog_lite.services.logs import (
     list_hosts, list_months, tail_file, apply_filters, summarize, pick_log_path, parse_kv, BASE as LOG_BASE
 )
 from watchlog_lite.services.ui import pretty_header, fold_dupes
+from watchlog_lite.services.detect import analyze_suspicious, summarize_bittorrent
+from watchlog_lite.services.format import pretty_line
 
-LOG_ROOT = Path("/var/log/watchguard")
 USER = os.getenv("WATCHLOG_USER", "admin")
 PASS = os.getenv("WATCHLOG_PASS", "changeme")
 
@@ -40,6 +41,7 @@ LAYOUT = """
  select,input[type=number],input[type=text]{background:#0f172a;border:1px solid #223054;border-radius:8px;color:#dbe3f4;padding:8px}
  button{background:#324e86;border:0;border-radius:9px;color:#fff;padding:8px 12px;cursor:pointer}
  pre{background:#0f172a;border:1px solid #223054;border-radius:12px;padding:12px;white-space:pre-wrap}
+ pre.pretty{white-space:pre-wrap;line-height:1.45}
  a{color:#9bbcff;text-decoration:none}
  mark{background:#f59e0b;color:#111;padding:0 2px;border-radius:3px}
  table.mini{border-collapse:collapse;margin:.5rem 0}
@@ -47,6 +49,7 @@ LAYOUT = """
  .badge{display:inline-block;padding:2px 6px;border-radius:6px;margin-right:6px}
  .badge.allow{background:#10b981;color:#0b251f}
  .badge.deny{background:#ef4444;color:#220606}
+ .badge.info{background:#374151;color:#e5e7eb}
  .flow{color:#cbd5e1;margin-right:8px}
  .nowrap{white-space:pre}
  .box{background:#0f172a;border:1px solid #223054;border-radius:12px;padding:12px}
@@ -55,6 +58,15 @@ LAYOUT = """
  .muted{color:#94a3b8}
  .chip{display:inline-block;padding:2px 6px;border-radius:6px;margin-left:6px;background:#334155;color:#cbd5e1}
  .chip.port{background:#1f2a44}
+ .ip{text-decoration:underline dotted}
+ .port{font-weight:700}
+ .app{color:#9ca3af;margin-left:6px}
+ .arrow{color:#6b7280;margin:0 6px}
+ .tag{padding:0 6px;border-radius:6px;font-size:11px;margin-left:6px}
+ .tag-bt{background:#f59e0b;color:#111827}
+ table.summary{border-collapse:collapse;margin:.5rem 0 1rem 0;font-size:13px}
+ table.summary th,table.summary td{border:1px solid #374151;padding:.35rem .5rem}
+ table.summary th{background:#111827;color:#e5e7eb;text-transform:uppercase;letter-spacing:.04em}
  .rel{position:relative}
  .popover{position:absolute;left:0;top:40px;z-index:60;display:none;max-width:540px;background:#0f172a;border:1px solid #223054;border-radius:12px;padding:12px;box-shadow:0 10px 30px rgba(2,6,23,.6)}
  .popover.open{display:block}
@@ -67,92 +79,9 @@ LAYOUT = """
 </div>
 """
 
-def list_hosts():
-    if not LOG_ROOT.exists(): return []
-    return sorted([p.name for p in LOG_ROOT.iterdir() if p.is_dir()])
+# (list_hosts, list_months, tail_file) are provided by watchlog_lite.services.logs
 
-def list_months(host):
-    base = LOG_ROOT/host
-    if not base.exists(): return []
-    return sorted([p.name for p in base.iterdir() if p.is_dir()])
-
-def tail_file(path: Path, n: int):
-    """Efficiently read last n lines from a potentially large file.
-    Falls back to None if file missing.
-    """
-    try:
-        with path.open("rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            block = 8192
-            buf = b""
-            pos = size
-            lines = []
-            while pos > 0 and len(lines) <= n:
-                rd = min(block, pos)
-                pos -= rd
-                f.seek(pos)
-                buf = f.read(rd) + buf
-                lines = buf.splitlines()
-            out = [l.decode("utf-8", "ignore") for l in lines[-n:]]
-            return out
-    except FileNotFoundError:
-        return None
-
-"""Helper functions have been moved into watchlog_lite.services.* modules."""
-
-# ---- Suspicious detectors (lightweight heuristics) ----
-PAT_BT = re.compile(r"(bittorrent|dht|announce|magnet:|d(?:st_)?port=(?:38315|51413|68[8-9]\d|69\d\d))", re.I)
-RISKY_PORTS = {23, 2323, 445, 3389, 1433, 3306, 5900, 5901, 25, 21}
-
-def _is_private_ip(ip: str) -> bool:
-    if not ip:
-        return False
-    if ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("127."):
-        return True
-    if ip.startswith("172."):
-        try:
-            second = int(ip.split(".")[1])
-            return 16 <= second <= 31
-        except Exception:
-            return False
-    return False
-
-def analyze_suspicious(lines):
-    bt_count = 0
-    bt_ips = set()
-    scan_map = {}  # src_ip -> set of dports
-    risky_port_counts = {}  # dport -> count
-
-    for ln in lines:
-        if PAT_BT.search(ln):
-            bt_count += 1
-            kv = parse_kv(ln)
-            ip = kv.get("src_ip")
-            if ip and _is_private_ip(ip):
-                bt_ips.add(ip)
-        # kv for scan/risky
-        kv = parse_kv(ln)
-        sip = kv.get("src_ip")
-        dpt = kv.get("dport")
-        act = (kv.get("action") or "").lower()
-        if sip and _is_private_ip(sip) and dpt and dpt.isdigit():
-            scan_map.setdefault(sip, set()).add(int(dpt))
-        if dpt and dpt.isdigit():
-            dpti = int(dpt)
-            if dpti in RISKY_PORTS and act == "allow":
-                risky_port_counts[dpti] = risky_port_counts.get(dpti, 0) + 1
-
-    # Build suspects list: top sources with many distinct dports
-    suspects = sorted(((sip, len(ports)) for sip, ports in scan_map.items()), key=lambda x: x[1], reverse=True)
-    suspects = [s for s in suspects if s[1] >= 10][:10]
-    risky_list = sorted(risky_port_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    return {
-        "bt_count": bt_count,
-        "bt_ips": sorted(bt_ips),
-        "scan_suspects": suspects,
-        "risky_ports": risky_list,
-    }
+"""Helper functions live in watchlog_lite.services.* modules."""
 
 @app.get("/")
 @requires_auth
@@ -230,6 +159,19 @@ def index():
         for val in refresh_opts
     )
 
+    # Quick filter chips (one-click)
+    chips = [
+      ("Allow", "action=Allow"),
+      ("Deny",  "action=Deny"),
+      ("BitTorrent", "bittorrent|magnet|announce|dht|d(?:st_)?port=(?:38315|68[8-9]\\d|69\\d\\d|51413)"),
+      ("Ports 6881–6999", "d(?:st_)?port=69\\d\\d|68[8-9]\\d"),
+      ("Port 38315", "d(?:st_)?port=38315"),
+    ]
+    chip_html = ' '.join(
+        f'<a class="chip" href="{prefix}?host={host}&ym={ym}&n={n}&view={view}&wrap={wrap}&refresh={refresh}&hide_dns={hide_dns}&hide_bcast={hide_bcast}&q={html.escape(qs)}">{html.escape(lbl)}</a>'
+        for (lbl, qs) in chips
+    )
+
     form = f"""
     <form class="bar" method="get" action="{prefix}">
       <label>Host <select name="host">{opts_host}</select></label>
@@ -255,6 +197,7 @@ def index():
       <label class="muted"><input type="checkbox" name="hide_bcast" value="1" {"checked" if hide_bcast=="1" else ""}> Hide broadcast</label>
       <button type="submit">View</button>
     </form>
+    <div class=\"bar\">{chip_html}</div>
     """
 
     # Render according to view
@@ -283,12 +226,12 @@ def index():
     else:  # pretty
         parts = []
         for base, suf in fold_dupes(lines):
-            kv = parse_kv(base)
-            header = pretty_header(kv)
-            txt = html.escape(base)
+            row = pretty_line(base)
             if regex:
-                txt = regex.sub(lambda m: f"<mark>{html.escape(m.group(0))}</mark>", txt)
-            parts.append(header + txt + suf)
+                raw = html.escape(base)
+                raw = regex.sub(lambda m: f"<mark>{html.escape(m.group(0))}</mark>", raw)
+                row = row + f"<div class='muted'>{raw}</div>"
+            parts.append(row + " " + suf)
         rendered = "\n".join(parts)
 
     # Top talkers / ports summary
@@ -303,6 +246,18 @@ def index():
         return f"<h3>{title}</h3><table class='mini'><tr><th>{kind}</th><th>count</th><th></th></tr>{items}</table>"
     summary_html  = mk_table("Top internal IPs", ips, "ip")
     summary_html += mk_table("Top dst ports", ports, "dport")
+
+    # BitTorrent suspects summary table (top IPs within current slice)
+    bt = summarize_bittorrent(lines)
+    if bt:
+        def _mk_ip_link(ip):
+            return (f"<a class=\"ip\" href=\"{prefix}?host={host}&ym={ym}&n={n}&view={view}&wrap={wrap}&q={html.escape(ip)}\">{html.escape(ip)}</a>")
+        rows = ''.join(f'<tr><td>{_mk_ip_link(ip)}</td><td>{cnt}</td></tr>' for ip, cnt in bt)
+        bt_html = ('<h3>Problem traffic (BitTorrent?)</h3>'
+                   '<table class="summary"><tr><th>IP</th><th>Hits</th></tr>'
+                   f'{rows}</table>')
+    else:
+        bt_html = ''
 
     # Suspicious activity panel
     sus = analyze_suspicious(lines)
@@ -327,7 +282,8 @@ def index():
     download_html = f'<div class="bar"><a href="{prefix}export?{qs}">Download</a></div>'
     if view in ("raw", "pretty"):
         pre_class = "" if wrap == "1" else "nowrap"
-        results_html = f'<pre class="{pre_class}">' + rendered + "</pre>"
+        cls = ("pretty " + pre_class).strip() if view == "pretty" else pre_class
+        results_html = f'<pre class="{cls}">' + rendered + "</pre>"
     else:
         results_html = '<div class="box lines">' + rendered + '</div>'
     saved_html = '<div class="bar"><input type="text" id="saveName" placeholder="Save as..." style="width:160px"><button type="button" id="saveBtn">Save filter</button><span id="savedList"></span></div>'
@@ -404,7 +360,7 @@ def index():
     """
 
 
-    content = form + saved_html + summary_html + counts_html + download_html + results_html + script
+    content = form + saved_html + bt_html + summary_html + counts_html + download_html + results_html + script
     return render_template_string(LAYOUT, content=content)
 
 @app.get("/export")
