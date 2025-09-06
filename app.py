@@ -101,6 +101,59 @@ def tail_file(path: Path, n: int):
 
 """Helper functions have been moved into watchlog_lite.services.* modules."""
 
+# ---- Suspicious detectors (lightweight heuristics) ----
+PAT_BT = re.compile(r"(bittorrent|dht|announce|magnet:|d(?:st_)?port=(?:38315|51413|68[8-9]\d|69\d\d))", re.I)
+RISKY_PORTS = {23, 2323, 445, 3389, 1433, 3306, 5900, 5901, 25, 21}
+
+def _is_private_ip(ip: str) -> bool:
+    if not ip:
+        return False
+    if ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("127."):
+        return True
+    if ip.startswith("172."):
+        try:
+            second = int(ip.split(".")[1])
+            return 16 <= second <= 31
+        except Exception:
+            return False
+    return False
+
+def analyze_suspicious(lines):
+    bt_count = 0
+    bt_ips = set()
+    scan_map = {}  # src_ip -> set of dports
+    risky_port_counts = {}  # dport -> count
+
+    for ln in lines:
+        if PAT_BT.search(ln):
+            bt_count += 1
+            kv = parse_kv(ln)
+            ip = kv.get("src_ip")
+            if ip and _is_private_ip(ip):
+                bt_ips.add(ip)
+        # kv for scan/risky
+        kv = parse_kv(ln)
+        sip = kv.get("src_ip")
+        dpt = kv.get("dport")
+        act = (kv.get("action") or "").lower()
+        if sip and _is_private_ip(sip) and dpt and dpt.isdigit():
+            scan_map.setdefault(sip, set()).add(int(dpt))
+        if dpt and dpt.isdigit():
+            dpti = int(dpt)
+            if dpti in RISKY_PORTS and act == "allow":
+                risky_port_counts[dpti] = risky_port_counts.get(dpti, 0) + 1
+
+    # Build suspects list: top sources with many distinct dports
+    suspects = sorted(((sip, len(ports)) for sip, ports in scan_map.items()), key=lambda x: x[1], reverse=True)
+    suspects = [s for s in suspects if s[1] >= 10][:10]
+    risky_list = sorted(risky_port_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    return {
+        "bt_count": bt_count,
+        "bt_ips": sorted(bt_ips),
+        "scan_suspects": suspects,
+        "risky_ports": risky_list,
+    }
+
 @app.get("/")
 @requires_auth
 def index():
@@ -136,7 +189,8 @@ def index():
         except re.error:
             regex = None
 
-    prefix = request.headers.get("X-Forwarded-Prefix", "/logs")
+    # Use X-Forwarded-Prefix when behind nginx; default to root for direct access
+    prefix = request.headers.get("X-Forwarded-Prefix", "/")
     if not prefix.endswith("/"):
         prefix += "/"
 
@@ -249,6 +303,23 @@ def index():
         return f"<h3>{title}</h3><table class='mini'><tr><th>{kind}</th><th>count</th><th></th></tr>{items}</table>"
     summary_html  = mk_table("Top internal IPs", ips, "ip")
     summary_html += mk_table("Top dst ports", ports, "dport")
+
+    # Suspicious activity panel
+    sus = analyze_suspicious(lines)
+    sus_rows = []
+    if sus["bt_count"]:
+        ips_html = ", ".join(html.escape(x) for x in sus["bt_ips"][:5])
+        link = f"{prefix}?host={host}&ym={ym}&n={n}&view={view}&wrap={wrap}&q=bittorrent|dht|announce|magnet:|dport=51413|dport=6881-6999"
+        sus_rows.append(f"<tr><td>BitTorrent signatures</td><td>{sus['bt_count']}</td><td class='muted'>{ips_html}</td><td><a href='{link}'>filter</a></td></tr>")
+    for sip, cntp in sus["scan_suspects"]:
+        link = f"{prefix}?host={host}&ym={ym}&n={n}&view={view}&wrap={wrap}&q=ip={html.escape(sip)}"
+        sus_rows.append(f"<tr><td>Port scan suspect</td><td>{cntp} dports</td><td class='muted'>{html.escape(sip)}</td><td><a href='{link}'>filter</a></td></tr>")
+    for dpt, cnt in sus["risky_ports"]:
+        link = f"{prefix}?host={host}&ym={ym}&n={n}&view={view}&wrap={wrap}&q=dport={dpt} action=Allow"
+        sus_rows.append(f"<tr><td>Risky port</td><td>{cnt}</td><td class='muted'>dport {dpt} Allow</td><td><a href='{link}'>filter</a></td></tr>")
+    if sus_rows:
+        sus_html = "<h3>Suspicious Activity</h3><table class='mini'><tr><th>flag</th><th>count</th><th>detail</th><th></th></tr>" + "".join(sus_rows) + "</table>"
+        summary_html = sus_html + summary_html
 
     # Download link (preserve query) + counts + copy link
     qs = request.query_string.decode() or ""
